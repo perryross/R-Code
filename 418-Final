@@ -1,0 +1,536 @@
+
+library(sf)
+library(plyr)
+library(dplyr)
+library(spdep)
+library(GISTools)
+library(raster)
+library(maptools)
+library(rgdal)
+library(spatstat)
+library(sp)
+library(spatstat)
+library(tmap)
+library(gstat)
+library(spgwr)
+library(grid)
+library(gridExtra)
+library(gtable)
+
+
+#Set working directory
+dir <- ("Z:/418/final/working")
+setwd(dir)
+
+#Reading in particulate matter dataset
+pm25 <- read.csv("PM25.csv") #Read in PM2.5 data
+#Select only columns 1 and 2
+pm25 <- pm25[,1:2]
+#Change the column names 
+colnames(pm25) <- c("POSTALCODE", "PM25")
+pm25 <- na.omit(pm25)
+
+#Reading in postal code shapefile
+postalcodes <- shapefile("BC_Postal_Codes") #Read in related postal code data
+
+#Reading in dissemination tract and income data
+income <- read.csv("Income.csv") #Read in census income data  
+colnames(income) <- c("DAUID", "Income") #Select only ID and Income columns
+census.tracts <- shapefile("BC_DA.shp") #Read in dissemination tract shapefile
+income.tracts <- merge(census.tracts,income, by = "DAUID") #Merge income and dissemination data
+nrow(income.tracts) #Determine the number of columns in the dataframe
+income.tracts <- income.tracts[!is.na(income.tracts$Income),]
+
+
+#Create choropleth map of income
+#med.income <- income.tracts$Income
+#shades <- auto.shading(med.income, n=6, cols = brewer.pal(6, 'Oranges'))
+#choropleth(income.tracts, med.income, shades) #map the data with associated colours
+#choro.legend(3864000, 1965000, shades) #add a legend (you might need to change the location)
+
+tm_shape(income.tracts) + 
+  tm_polygons(col = "Income", 
+              title = "Income", 
+              style = "fisher", 
+              palette = "-RdBu", n = 6) +
+  tm_legend(legend.outside = FALSE) +
+  tm_layout(legend.position = c("left","bottom")) 
+
+
+#Select postal codes that fall within dissemination tracts)
+postalcodes <- intersect(postalcodes,income.tracts)
+plot(postalcodes) #See what the data looks like spatially
+head(postalcodes) #See what the data looks like in tabular form
+
+#Join PM2.5 data with postal code data
+pm25.spatial <- merge(postalcodes,pm25,by = "POSTALCODE")
+
+#Aggregate the PM2.5 values in each DA in order to have a single value per DA. Here we aggregate based on the max.
+pm25.aggregate <- aggregate((as.numeric(pm25.spatial$PM25)/10)~pm25.spatial$DAUID,FUN=max)
+
+#Re-join aggregated data to the income.tracts layer.
+colnames(pm25.aggregate) <- c("DAUID", "PM25AGG") #Select only ID and Income columns
+income.pm25 <- merge(income.tracts,pm25.aggregate, by = "DAUID") #Merge income and dissemination data
+
+#Re-join aggregated data to the pm25.spatial points layer.
+pm25.points.aggregate <- merge(pm25.spatial, pm25.aggregate, by = "DAUID")
+
+#Create a subsample of the datapoints provided in the PM2.5 dataset using the sample n provided on CourseSpaces
+
+sampleSize=280
+spSample <- pm25.points.aggregate[sample(1:length(pm25.points.aggregate),sampleSize),]
+
+plot(spSample)
+
+#DESCRIPTIVE STATS
+mean.pm <- mean(income.pm25$PM25AGG, na.rm = TRUE)
+mode.pm <- as.numeric(names(sort(table(income.pm25$PM25AGG), decreasing = TRUE))[1])
+median.pm <- median(income.pm25$PM25AGG, na.rm = TRUE)
+sd.pm <- sd(income.pm25$PM25AGG, na.rm = TRUE)
+mean.pm <- round(mean.pm, digits = 2)
+sd.pm <- round(sd.pm, digits = 2)
+
+mean.inc <- mean(income.pm25$Income, na.rm = TRUE)
+mode.inc <- as.numeric(names(sort(table(income.pm25$Income), decreasing = TRUE))[1])
+median.inc <- median(income.pm25$Income, na.rm = TRUE)
+sd.inc <- sd(income.pm25$Income, na.rm = TRUE, digits = 2)
+mean.inc <- round(mean.inc, digits = 2)
+sd.inc <- round(sd.inc, digits = 2)
+
+
+
+#Create a grid called grd to use in your interpolation
+# Create an empty grid where n is the total number of cells
+grd <- as.data.frame(spsample(spSample, "regular", n=5000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+proj4string(grd) <- proj4string(spSample)
+
+
+########### MORANS I--GLOBAL
+inc.i <- poly2nb(income.tracts, queen = FALSE)                              #CALCULATES NEIGBOUR WEIGHTS MATRIXS. POLYGONS THAT ARE NEIGHBOURS ARE VALUED 1
+crd.net <- nb2lines(inc.i,coords=coordinates(income.tracts)) #CONVERTS NEIGHBOUR MATRIX INTO LINES WE CAN PLOT
+
+
+inc.lw <- nb2listw(inc.i, zero.policy = TRUE, style = "W")#WEIGHT MATRIX
+print.listw(inc.lw, zero.policy = TRUE)
+
+mi <- moran.test(income.tracts$Income, inc.lw, zero.policy = TRUE)#LOOKS AT MEDIAN INC. GIVE IT WIEGHT MATRIX
+mi
+
+moran.range <- function(lw) {
+  wmat <- listw2mat(lw)
+  return(range(eigen((wmat + t(wmat))/2)$values))
+}
+moran.range(inc.lw)
+
+mI <- mi$estimate[[1]]#MORANS I
+eI <- mi$estimate[[2]]#EXPECTED
+var <- mi$estimate[[3]]#VARIANCE
+
+z <- ((mI-(eI))/sqrt(var))#IS THE MORANS I SIGNIFICANT
+
+#LOCAL MORANS I #use z score bc it is directional 
+
+lisa.test <- localmoran(income.tracts$Income,inc.lw)#GIVE IN MEDIAN INC AND WEIGHT MATRIX
+
+income.tracts$Ii <- lisa.test[,1]
+income.tracts$E.Ii<- lisa.test[,2]
+income.tracts$Var.Ii<- lisa.test[,3]
+income.tracts$Z.Ii<- lisa.test[,4]
+income.tracts$P<- lisa.test[,5]
+
+map_LISA <- tm_shape(income.tracts) + #THIS IS MAPING THE MORANS i. bUT CAN BE USED WITH Z OR P OR OTHET STATS
+  tm_polygons(col = "Ii", 
+              title = "Local Moran's I", 
+              style = "fisher", 
+              palette = "YlGn", n = 6) +
+tm_legend(legend.outside = FALSE) +
+tm_layout(legend.position = c("left","bottom")) 
+
+
+map_LISA
+
+map_LISA <- tm_shape(income.tracts) + #THIS IS MAPING THE MORANS i. bUT CAN BE USED WITH Z OR P OR OTHET STATS
+  tm_polygons(col = "Z.Ii", 
+              title = "Z-value Income", 
+              style = "fisher", 
+              palette = "YlGn", n = 6) +
+  tm_legend(legend.outside = FALSE) +
+  tm_layout(legend.position = c("left","bottom")) 
+
+
+map_LISA
+
+
+
+
+moran.plot(income.tracts$Income, inc.lw, zero.policy=NULL, spChk=NULL, labels=NULL, xlab="Mean Income", 
+           ylab="Spatially Lagged Income", quiet=NULL)
+
+############ INTERPOLATION
+##Spatial Interpolation with IDW
+
+# Create an empty grid where n is the total number of cells
+grd <- as.data.frame(spsample(spSample, "regular", n=5000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+proj4string(grd) <- proj4string(spSample)
+
+proj4string(grd) <- proj4string(pm25.points.aggregate)#use same proj as monitorinf station
+P.idw <- gstat::idw(PM25AGG ~ 1, spSample, newdata=grd, idp=2)#this is the idw interpolation idp=power function play with to compare results
+r.idw       <- raster(P.idw)
+
+
+tm_shape(r.idw) + 
+  tm_raster(n=10,palette = "-PuOr",
+            title="Predicted PM25 \n(in ppm)") + 
+  tm_shape(spSample) + tm_dots(size=0.2) +
+  tm_legend(legend.outside=TRUE)
+
+#################################################
+# Leave-one-out validation routine ###check how it woks
+IDW.out <- vector(length = length(spSample))
+for (i in 1:length(spSample)) {                                                       #WILL AFFECT rmse-TRY TO FIND LOWEST RSME
+  IDW.out[i] <- gstat:: idw(PM25AGG ~ 1, spSample[-i,], spSample[i,], idp=2)$var1.pred#idp power set to .5= very little variation PLAY AROUND W THIS
+}#leaves out a point, fit a surface, compare it to original. ####NEED TO USE IDW TECHNIQUE FROM GSTAT---gstat::---put before idw(value)
+
+OP <- par(pty="s", mar=c(4,3,0,0))
+plot(IDW.out ~ spSample$PM25AGG, asp=1, xlab="Observed", ylab="Predicted", pch=16,
+     col=rgb(0,0,0,0.5))
+abline(lm(IDW.out ~ spSample$PM25AGG), col="red", lw=2,lty=2)
+abline(0,1)
+par(OP)
+sqrt( sum((IDW.out - spSample$PM25AGG)^2) / length(spSample))#RSME
+
+########################################################
+# Implementation of a jackknife technique to estimate a confidence interval at each unsampled point.
+# Create the interpolated surface
+img <- gstat::idw(PM25AGG~1, spSample, newdata=grd, idp=2)
+n   <- length(spSample)
+Zi  <- matrix(nrow = length(img$var1.pred), ncol = n)
+
+# Remove a point then interpolate (do this n times for each point)
+st <- stack()
+for (i in 1:n){
+  Z1 <- gstat::idw(PM25AGG~1, spSample[-i,], newdata=grd, idp=2)
+  st <- addLayer(st,raster(Z1,layer=1))
+  # Calculated pseudo-value Z at j
+  Zi[,i] <- n * img$var1.pred - (n-1) * Z1$var1.pred
+}
+
+# Jackknife estimator of parameter Z at location j
+Zj <- as.matrix(apply(Zi, 1, sum, na.rm=T) / n )
+
+# Compute (Zi* - Zj)^2
+c1 <- apply(Zi,2,'-',Zj)            # Compute the difference
+c1 <- apply(c1^2, 1, sum, na.rm=T ) # Sum the square of the difference
+
+# Compute the confidence interval
+CI <- sqrt( 1/(n*(n-1)) * c1)
+
+# Create (CI / interpolated value) raster
+img.sig   <- img
+img.sig$var1.pred <- CI /img$var1.pred 
+
+
+r <- raster(img.sig, layer="var1.pred")
+
+plot(r)
+# Plot the map
+tm_shape(r) + tm_raster(n=7,title="95% confidence interval \n(in ppm)") +
+  tm_shape(spSample) + tm_dots(size=0.2) +
+  tm_legend(legend.outside=TRUE) 
+
+ 
+
+
+
+#These steps will help you combine the outputs from your spatial interpolation with your income data.
+
+#If you have too many cells, you can reduce the number by aggregating values
+#step.1 <- aggregate(grd, fact=??, fun=mean)
+#plot(step.1)
+
+#Convert the raster dataset to points
+#step.2 <-  rasterToPoints(r.idw,fun=NULL, spatial=FALSE, crs= spSample)
+#step.2 <- as.data.frame(step.2) #convert the point dataset to a spatial dataframe
+#Coords <- step.2[,c("x", "y")]  #assign coordinates to a new object
+#crs <- crs(census.tracts) #utilize an existing projection
+#step.3 <- SpatialPointsDataFrame(coords = Coords, data = step.2, proj4string = crs) #create a spatial points dataframe
+#step.4 <- aggregate(x=step.3,by=income.tracts, FUN=mean) #aggregate points into census tracts
+#step.5 <- intersect(step.4,income.tracts)  #get the intersection of step.4 with the income.tracts dataset (this will take a while) 
+#gets a mean pm25 for each polygon
+
+step.5 <-extract(r.idw, income.tracts, fun = mean, sp = TRUE)
+
+pm.income.poly <- step.5
+
+plot(pm.income.poly)
+
+tm_shape(pm.income.poly) + 
+  tm_polygons(col = "var1.pred", 
+              title = "PM2.5 Values (In ppm)", 
+              style = "fisher", 
+              palette = "magma", n = 5) 
+#You are now ready to perform a regression
+#pm.income.poly <- pm.income.poly[!is.na(pm.income.poly$Income),]
+
+######Linear Regression##########
+
+
+#Let's say your dataset with both PM2.5 and Income are stored in a dataset called pm.income.poly.
+
+#Plot income and PM2.5 from the pm.income.poly dataset you created
+plot(pm.income.poly$Income~pm.income.poly$var1.pred)
+
+#Notice that there are a lot of 0's in this dataset. If you decide to remove them, use the following line:
+pm.income.poly <-  pm.income.poly[!is.na(pm.income.poly$var1.pred),]
+
+#Now plot the data again
+plot(pm.income.poly$Income~pm.income.poly$var1.pred)
+
+#Perform a linear regression on the two variables. You should decide which one is dependent.
+lm.model <- lm(pm.income.poly$Income~pm.income.poly$var1.pred)
+#Add the regression model to the plot you created
+abline(lm.model)
+#Get the summary of the results
+summary(lm.model)
+
+#You want to determine if the model residuals are spatially clustered. 
+#First obtain the residuals from the model
+model.resids <- as.data.frame(residuals.lm(lm.model))
+#Then add the residuals to your spatialpolygon dataframe
+pm.income.poly$residuals <- residuals.lm(lm.model)
+
+head(pm.income.poly)
+
+#Tmap of residuals
+ tm_shape(pm.income.poly) + 
+  tm_polygons(col = "residuals", 
+              title = "Residuals", 
+              style = "fisher", 
+              palette = "-RdBu", n = 6) +
+  tm_legend(legend.outside = TRUE) 
+
+
+
+
+########### MORANS I--GLOBAL
+resids.i <- poly2nb(pm.income.poly, queen = FALSE)                              #CALCULATES NEIGBOUR WEIGHTS MATRIXS. POLYGONS THAT ARE NEIGHBOURS ARE VALUED 1
+crd.net <- nb2lines(inc.i,coords=coordinates(income.tracts)) #CONVERTS NEIGHBOUR MATRIX INTO LINES WE CAN PLOT
+
+
+resids.lw <- nb2listw(resids.i, zero.policy = TRUE, style = "W")#WEIGHT MATRIX
+print.listw(inc.lw, zero.policy = TRUE)
+
+mi <- moran.test(pm.income.poly$residuals, resids.lw, zero.policy = TRUE)#LOOKS AT MEDIAN INC. GIVE IT WIEGHT MATRIX
+mi
+
+moran.range <- function(lw) {
+  wmat <- listw2mat(lw)
+  return(range(eigen((wmat + t(wmat))/2)$values))
+}
+moran.range(resids.lw)
+
+mI.r <- mi$estimate[[1]]#MORANS I
+eI.r <- mi$estimate[[2]]#EXPECTED
+var.r <- mi$estimate[[3]]#VARIANCE
+
+z.r <- ((mI.r-(eI.r))/sqrt(var.r))#IS THE MORANS I SIGNIFICANT
+
+#LOCAL MORANS I #use z score bc it is directional 
+
+lisa.test.r <- localmoran(pm.income.poly$residuals, resids.lw)#GIVE IN MEDIAN INC AND WEIGHT MATRIX
+
+pm.income.poly$Ii <- lisa.test.r[,1]
+pm.income.poly$E.Ii<- lisa.test.r[,2]
+pm.income.poly$Var.Ii<- lisa.test.r[,3]
+pm.income.poly$Z.Ii<- lisa.test.r[,4]
+pm.income.poly$P<- lisa.test.r[,5]
+
+map_LISA <- tm_shape(pm.income.poly) + #THIS IS MAPING THE MORANS i. bUT CAN BE USED WITH Z OR P OR OTHET STATS
+  tm_polygons(col = "Ii", 
+              title = "Local Moran's I Residuals", 
+              style = "fisher", 
+              palette = "YlGnBu", n = 5) +
+tm_legend(legend.outside = TRUE) 
+
+map_LISA
+
+map_LISA <- tm_shape(pm.income.poly) + #THIS IS MAPING THE MORANS i. bUT CAN BE USED WITH Z OR P OR OTHET STATS
+  tm_polygons(col = "Z.Ii", 
+              title = "Z-Values Residuals", 
+              style = "fisher", 
+              palette = "YlGnBu", n = 5) +
+  tm_legend(legend.outside = TRUE) 
+
+map_LISA
+
+moran.plot(pm.income.poly$residuals, resids.lw, zero.policy=NULL, spChk=NULL, labels=NULL, xlab=" Density", 
+           ylab="Spatially Lagged Population Density", quiet=NULL)
+
+
+
+
+####Geographically Weighted Regression##########
+
+
+#Let's say you are continuing with your data from the regression analysis. 
+
+
+#The first thing you need to do is to add the polygon coordinates to the spatialpolygondataframe.
+
+#You can obtain the coordinates using the "coordinates" function from the sp library
+
+pm.income.poly.coords <- sp::coordinates(pm.income.poly)
+
+#Observe the result
+
+head(pm.income.poly.coords)
+
+#Now add the coordinates back to the spatialpolygondataframe
+
+pm.income.poly$X <- pm.income.poly.coords[,1]
+pm.income.poly$Y <- pm.income.poly.coords[,2]
+head(pm.income.poly)
+
+
+
+###Determine the bandwidth for GWR: this will take a while
+
+GWRbandwidth <-spgwr:: gwr.sel(pm.income.poly$Income~pm.income.poly$var1.pred, 
+                        data=pm.income.poly, coords=cbind(pm.income.poly$X,pm.income.poly$Y),adapt=T) 
+
+
+
+###Perform GWR on the two variables with the bandwidth determined above
+
+###This will take a looooooong while
+
+gwr.model = gwr(pm.income.poly$Income~pm.income.poly$var1.pred, 
+                data=pm.income.poly, coords=cbind(pm.income.poly$X,pm.income.poly$Y), 
+                adapt=GWRbandwidth, hatmatrix=TRUE, se.fit=TRUE) 
+
+
+
+#Print the results of the model
+
+gwr.model
+
+
+
+#Look at the results in detail
+
+
+results<-as.data.frame(gwr.model$SDF)
+head(results)
+
+
+
+#Now for the magic. Let's add our local r-square values to the map
+
+pm.income.poly$localr <- results$localR2
+
+
+#Create t map of r-square values
+
+tm_shape(pm.income.poly) + 
+  tm_polygons(col = "localr", 
+              title = "r-squared", 
+              style = "fisher", 
+              palette = "-RdBu", n = 6) +
+  tm_legend(legend.outside = TRUE)
+
+
+#Time for more magic. Let's map the coefficients
+
+
+pm.income.poly$coeff <- results$pm.income.poly.var1.pred
+
+
+#Create t map of the coefficients
+
+
+tm_shape(pm.income.poly) + #THIS IS MAPING THE MORANS i. bUT CAN BE USED WITH Z OR P OR OTHET STATS
+  tm_polygons(col = "coeff", 
+              title = "coefficient", 
+              style = "quantile", 
+              palette = "-PuOr", n = 5) +
+  tm_legend(legend.outside = TRUE)
+
+
+
+######NEAREST NEIGHBOUR########
+
+
+spSampleproj <- spTransform(spSample, CRS("+init=epsg:3005"))
+
+income.tracts.t <- spTransform(income.tracts, CRS("+init=epsg:3005"))
+
+spSampleproj$x <- coordinates(spSampleproj)[,1]
+spSampleproj$y <- coordinates(spSampleproj)[,2]
+
+#check for and remove duplicated points
+#check for duplicated points
+#finds zero distance among points
+zd <- zerodist(spSampleproj)
+zd
+
+#remove duplicates
+GVA <- remove.duplicates(spSampleproj)
+
+#create an "extent" object which can be used to create the observation window for spatstat
+GVA.ext <- as.matrix(extent(GVA)) 
+
+#observation window
+window <- as.owin(list(xrange = GVA.ext[1,], yrange = GVA.ext[2,]))
+
+#create ppp oject from spatstat
+GVA.ppp <- ppp(x = GVA$x, y = GVA$y, window = window)
+
+nearestNeighbour <- nndist(GVA.ppp)
+
+
+##Convert the nearestNeighbor object into a dataframe.
+nearestNeighbour=as.data.frame(as.numeric(nearestNeighbour))
+##Change the column name to "Distance"
+colnames(nearestNeighbour) = "Distance"
+
+
+##Calculate the nearest neighbor statistic to test for a random spatial distribution.
+#mean nearest neighbour
+nnd = (sum(nearestNeighbour$Distance))/n
+
+#mean nearest neighbour for random spatial distribution
+
+studyArea <- gArea(income.tracts.t)
+pointDensity <- n/studyArea
+
+r.nnd = 1/(2*sqrt(pointDensity))
+
+d.nnd = 1.07453/(sqrt(pointDensity))
+
+R = nnd/r.nnd
+
+SE.NND <- 0.26136/(sqrt(n*pointDensity))
+
+z.nnd = (nnd-r.nnd)/SE.NND
+
+
+
+#STUDY AREA MAP
+tm_shape(income.tracts) +
+  tm_polygons(col="tan") +
+  tm_shape(income.tracts.t) +
+  tm_borders(col = "black", lwd = .001) +
+  tm_layout(title = "Study Area Map of Greater Vancouver", title.position = c("RIGHT", "TOP"))+
+  tm_compass(north = 0, type = NA, text.size = 0.8, position = c("left","bottom"))
+
+ 
+  
+
